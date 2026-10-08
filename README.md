@@ -1,36 +1,89 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Ad spend dashboard
 
-## Getting Started
+Internal tool for Spacetrans. Shows daily Meta and Google Ads spend per campaign
+in one place, so nobody has to ask the PPC team for numbers.
 
-First, run the development server:
+Not multi-tenant, not for sale, one shared password.
+
+## What it shows
+
+Per campaign: spend, leads, clicks, conversion rate, daily budget, cost per lead.
+Defaults to **yesterday** — the current day is deliberately excluded, because both
+platforms still report it as an estimate that moves all day.
+
+Three views: **Dashboard** (platform split, daily mix, top campaigns), **Charts**
+(time series), **Table** (row-level data, searchable).
+
+## Running it
 
 ```bash
+npm install
+cp .env.example .env.local   # then fill it in
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+| Variable | Where it comes from |
+|---|---|
+| `DATABASE_URL` | Hostinger MySQL. Remote access must be whitelisted per IP. |
+| `META_ACCESS_TOKEN` | Business Manager → System Users → token with `ads_read`. Never expires. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Cloud service-account key, pasted as one line. |
+| `GOOGLE_LOGIN_CUSTOMER_ID` | The MCC customer id, **digits only** — hyphens cause a silent 401. |
+| `DASHBOARD_PASSWORD` | The shared login. |
+| `SESSION_SECRET` | `openssl rand -hex 32` |
+| `CRON_SECRET` | Bearer token the nightly sync expects. |
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Setting up a new account
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+node scripts/migrate.mjs               # apply SQL migrations, in order, once each
+node scripts/seed-accounts.mjs         # discover Meta ad accounts
+node --experimental-strip-types scripts/seed-google-accounts.mjs
+```
 
-## Learn More
+Then **backfill once**, or every range before today will be empty:
 
-To learn more about Next.js, take a look at the following resources:
+```
+GET /api/cron/sync?months=14     Authorization: Bearer $CRON_SECRET
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The nightly job (`GET /api/cron/sync`) only re-reads a trailing 7 days. That window
+exists to absorb restatements, not to fetch history.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Things that will bite you
 
-## Deploy on Vercel
+**Meta returns five identical lead action types.** `lead`,
+`onsite_conversion.lead_grouped` and three `offsite_*_add_meta_leads` all carry the
+*same* number. Summing them inflates leads 5× and divides cost-per-lead by 5. Take
+the first match from the priority list; never sum.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+**Google refuses to mix cost with conversion-category segmentation.** Selecting
+`metrics.cost_micros` alongside `segments.conversion_action_category` returns a 400
+— which is the API protecting you from spend being repeated once per category. So
+spend and leads come from two separate queries, joined on campaign and date.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**Money arrives in different units.** Meta budgets are in paise (÷100) while Meta
+spend is in rupees; Google uses micros (÷1,000,000) for both. Everything in the
+database is rupees.
+
+**Campaign budgets hide on Meta ad sets.** With Campaign Budget Optimisation off,
+the campaign-level daily budget is empty and the real figure is the sum of the
+*active* ad sets. Counting paused ones overstates it.
+
+**`listAccessibleCustomers` does not list accounts under a manager.** It returns
+only what the service account is directly linked to — for an MCC link, just the MCC.
+Querying `customer_client` from the manager is what enumerates the real accounts.
+
+**Hostinger closes idle MySQL connections.** The pool retires its own after 30s and
+keeps at most two idle. Without that, the first page load after a quiet night dies
+with `ECONNRESET` — i.e. every morning.
+
+**Next 16 specifics.** The middleware file is `proxy.ts`; creating `middleware.ts`
+silently does nothing. `cacheComponents` is on, so `export const dynamic` is a build
+error and auth-gated pages carry `export const instant = false` instead.
+
+## Reconciliation
+
+Both integrations were checked against the platforms' own account-level totals
+before being trusted — Meta's September matched to the paisa, Google's to three
+paise (per-row rounding). Re-run that check after any change to the sync: a spend
+dashboard that disagrees with the platform is worse than no dashboard.
